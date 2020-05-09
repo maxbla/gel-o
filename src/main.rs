@@ -1,8 +1,7 @@
-use evdev_rs::{
-    Device, InputEvent, UInputDevice,
-};
+use evdev_rs::{Device, InputEvent, UInputDevice};
 use std::ffi::OsStr;
 use std::fs::{read_dir, File};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::{fs::FileTypeExt, io::AsRawFd};
 //TODO - switch to mio
 use epoll::ControlOptions;
@@ -19,41 +18,41 @@ fn get_all_device_files() -> std::io::Result<Vec<File>> {
             continue;
         }
 
-        //TODO: consider using /dev/input/by-id
-        // let location = std::fs::read_link(entry.path())?;
-        // let real_location = entry.path().ancestors().nth(1).unwrap().join(location).canonicalize();
-        // println!("opening: {:?}, real location: {:?}", entry.path(), real_location);
-        // let file = File::open(entry.path())?;
-        // res.push(file);
-
         // these files don't play nice with libevdev, not sure why
-        let ignore = [OsStr::new("mouse0"), OsStr::new("mice")];
-        match entry.path().file_name() {
-            Some(file_name) => {
-                if !ignore.contains(&file_name) {
-                    println!("opening: {:?}", entry.path());
-                    let file = File::open(entry.path())?;
-                    res.push(file);
+        // see: https://askubuntu.com/questions/1043832/difference-between-dev-input-mouse0-and-dev-input-mice
+        entry
+            .path()
+            .file_name()
+            .map(|file_name| -> std::io::Result<()> {
+                let bytes = file_name.as_bytes();
+                // skip filenames matching "mouse.* or mice"
+                if bytes == OsStr::new("mice").as_bytes()
+                    || &bytes[0..=4] == OsStr::new("mouse").as_bytes()
+                {
+                    return Ok(());
                 }
-            }
-            None => {}
-        }
+                println!("opening: {:?}", entry.path());
+                let file = File::open(entry.path())?;
+                res.push(file);
+                Ok(())
+            });
     }
     Ok(res)
 }
-fn main() -> std::io::Result<()> {
-    //println!("{:?}", std::env::args().collect::<Vec<_>>());
-    let ms_delay: u32 = std::env::args().nth(1).map(|arg| arg.parse().unwrap()).unwrap_or(60);
 
+fn main() -> std::io::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let ms_delay: u32 = args.get(1).map(|arg| arg.parse().unwrap()).unwrap_or(60);
+
+    //wait for enter key to be released after starting
     sleep(Duration::from_millis(250));
 
     println!("opening /dev/input files...");
     let device_files = get_all_device_files()?;
-    println!("opened /dev/input files");
 
-    println!("setting up epoll...");
+    println!("initalizing epoll...");
     let epoll_fd = epoll::create(true)?;
-    //add file descriptors to epoll
+    // add file descriptors to epoll
     for (file_idx, file) in device_files.iter().enumerate() {
         let device_fd = file.as_raw_fd();
         let epoll_event = epoll::Event::new(epoll::Events::EPOLLIN, file_idx as u64);
@@ -64,7 +63,6 @@ fn main() -> std::io::Result<()> {
             epoll_event,
         )?;
     }
-    println!("epoll set up!");
 
     let devices = device_files
         .into_iter()
