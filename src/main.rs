@@ -1,5 +1,5 @@
 use evdev_rs::{Device, InputEvent, UInputDevice};
-use std::collections::VecDeque;
+use std::collections::BTreeMap;
 use std::convert::TryInto;
 use std::error::Error;
 use std::ffi::OsStr;
@@ -54,6 +54,150 @@ where
     Ok(epoll_fd)
 }
 
+pub enum GrabErr {
+    /// ignore event
+    DontSimulate,
+    /// ungrab events
+    Stop,
+}
+
+// apply function to all InputEvents
+// Function takes InputEvent as input and returns a Result of tuple of (time at
+// which to simulate input, event to simulate). If the Result is Err, the event
+// is discarded. Otherwise, the event is simulated.
+pub fn filter_map_events_with_delay<F>(mut func: F) -> io::Result<()>
+where
+    F: FnMut(InputEvent) -> Result<(Instant, InputEvent), GrabErr>,
+{
+    let device_files = get_all_device_files()?;
+    let epoll_fd = epoll_watch_all(device_files.iter())?;
+    let mut devices = device_files
+        .into_iter()
+        .map(|file| Device::new_from_fd(file))
+        .collect::<io::Result<Vec<Device>>>()?;
+    let output_devices = devices
+        .iter()
+        .map(|device| UInputDevice::create_from_device(device))
+        .collect::<io::Result<Vec<UInputDevice>>>()?;
+    //grab devices
+    let _grab = devices
+        .iter_mut()
+        .map(|device| device.grab(evdev_rs::GrabMode::Grab))
+        .collect::<io::Result<()>>()?;
+    // create buffer for epoll to fill
+    let mut epoll_buffer = [epoll::Event::new(epoll::Events::empty(), 0); 4];
+    let mut events_buffer = BTreeMap::<Instant, (Instant, InputEvent, usize)>::new();
+    'event_loop: loop {
+        let process_later = events_buffer.split_off(&Instant::now());
+        let process_now = events_buffer;
+        events_buffer = process_later;
+        for (recieved_inst, event, idx) in process_now.values() {
+            println!(
+                "Actual time waited: {}",
+                recieved_inst.elapsed().as_millis()
+            );
+            let output_device = output_devices.get(*idx).unwrap();
+            output_device.write_event(event).unwrap();
+        }
+        //wait until new events need to be processed or new events arrive
+        let wait_ms: i32 = events_buffer
+            .keys()
+            .nth(0)
+            .and_then(|sim_inst| {
+                sim_inst
+                    .checked_duration_since(Instant::now())
+                    .unwrap_or_default()
+                    .checked_add(Duration::from_millis(1))?
+                    .as_millis()
+                    .try_into()
+                    .ok()
+            })
+            .unwrap_or(-1i32);
+        println!("Waiting for {}ms for new events...", wait_ms);
+        let num_events = epoll::wait(epoll_fd, wait_ms, &mut epoll_buffer)?;
+        //add new events to queue
+        for event in &epoll_buffer[0..num_events] {
+            let device_idx = event.data as usize;
+            let device = devices.get(device_idx).unwrap();
+            while device.has_event_pending() {
+                //TODO: deal with EV_SYN::SYN_DROPPED
+                let (_, event) = device.next_event(evdev_rs::ReadFlag::NORMAL)?;
+                match func(event) {
+                    Ok((instant, event)) => {
+                        events_buffer.insert(instant, (Instant::now(), event, device_idx));
+                    }
+                    Err(err) => match err {
+                        GrabErr::Stop => break 'event_loop,
+                        _ => {}
+                    },
+                }
+            }
+        }
+    }
+
+    //cleanup
+    let _ungrab = devices
+        .iter_mut()
+        .map(|device| device.grab(evdev_rs::GrabMode::Ungrab))
+        .collect::<io::Result<()>>()?;
+
+    epoll::close(epoll_fd)?;
+    Ok(())
+}
+
+pub fn filter_map_events<F>(func: F) -> io::Result<()>
+where
+    F: Fn(InputEvent) -> Result<InputEvent, GrabErr>,
+{
+    let device_files = get_all_device_files()?;
+    let epoll_fd = epoll_watch_all(device_files.iter())?;
+    let mut devices = device_files
+        .into_iter()
+        .map(|file| Device::new_from_fd(file))
+        .collect::<io::Result<Vec<Device>>>()?;
+    let output_devices = devices
+        .iter()
+        .map(|device| UInputDevice::create_from_device(device))
+        .collect::<io::Result<Vec<UInputDevice>>>()?;
+    //grab devices
+    let _grab = devices
+        .iter_mut()
+        .map(|device| device.grab(evdev_rs::GrabMode::Grab))
+        .collect::<io::Result<()>>()?;
+    // create buffer for epoll to fill
+    let mut epoll_buffer = [epoll::Event::new(epoll::Events::empty(), 0); 4];
+    'event_loop: loop {
+        let num_events = epoll::wait(epoll_fd, -1, &mut epoll_buffer)?;
+        //map and simulate events
+        for event in &epoll_buffer[0..num_events] {
+            let device_idx = event.data as usize;
+            let device = devices.get(device_idx).unwrap();
+            while device.has_event_pending() {
+                //TODO: deal with EV_SYN::SYN_DROPPED
+                let (_, event) = device.next_event(evdev_rs::ReadFlag::NORMAL)?;
+                match func(event) {
+                    Ok(event) => output_devices
+                        .get(device_idx)
+                        .unwrap()
+                        .write_event(&event)?,
+                    Err(err) => match err {
+                        GrabErr::Stop => break 'event_loop,
+                        _ => {}
+                    },
+                }
+            }
+        }
+    }
+
+    let _ungrab = devices
+        .iter_mut()
+        .map(|device| device.grab(evdev_rs::GrabMode::Ungrab))
+        .collect::<io::Result<()>>()?;
+
+    epoll::close(epoll_fd)?;
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
     let ms_delay: u32 = args.get(1).map(|arg| arg.parse().unwrap()).unwrap_or(60);
@@ -63,70 +207,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     //wait for enter key to be released after starting
     sleep(Duration::from_millis(500));
 
-    println!("opening /dev/input files...");
-    let device_files = get_all_device_files()?;
-    let epoll_fd = epoll_watch_all(device_files.iter())?;
-
-    let mut devices = device_files
-        .into_iter()
-        .map(|file| Device::new_from_fd(file))
-        .collect::<io::Result<Vec<Device>>>()?;
-
-    let output_devices = devices
-        .iter()
-        .map(|device| UInputDevice::create_from_device(device))
-        .collect::<io::Result<Vec<UInputDevice>>>()?;
-
-    //grab devices
-    let _grab = devices
-        .iter_mut()
-        .map(|device| device.grab(evdev_rs::GrabMode::Grab))
-        .collect::<io::Result<()>>()?;
-
-    let mut events_buffer =
-        VecDeque::<(Instant, usize, InputEvent)>::with_capacity(ms_delay.try_into()?);
-    // create buffer for epoll to fill
-    let mut epoll_buffer = [epoll::Event::new(epoll::Events::empty(), 0); 4];
-    loop {
-        //process queued events...
-        while events_buffer
-            .front()
-            .map(|(in_time, _, _)| in_time.elapsed() > Duration::from_millis(ms_delay.into()))
-            .unwrap_or(false)
-        {
-            let (in_time, idx, event) = events_buffer.pop_front().unwrap();
-            let output_device = output_devices.get(idx).unwrap();
-            let time_waited = in_time.elapsed();
-            println!(
-                "Actual amount of time waited: {}.{} ms",
-                time_waited.as_millis(),
-                time_waited.as_micros()
-            );
-            output_device.write_event(&event).unwrap();
+    let mut event_count = 0;
+    filter_map_events_with_delay(move |event| {
+        event_count += 1;
+        if event_count > 100 {
+            return Err(GrabErr::Stop);
         }
-        //wait until new events need to be processed or new events arrive
-        let wait_ms = events_buffer
-            .front()
-            .and_then(|(in_time, _, _)| {
-                Duration::from_millis(u64::from(ms_delay))
-                    .checked_add(Duration::from_micros(250))?
-                    .checked_sub(in_time.elapsed())?
-                    .as_millis()
-                    .try_into()
-                    .ok()
-            })
-            .unwrap_or(-1i32);
-        println!("waiting... {:?}ms", wait_ms);
-        let num_events = epoll::wait(epoll_fd, wait_ms, &mut epoll_buffer)?;
-        //add new events to queue
-        for event in &epoll_buffer[0..num_events] {
-            let device_idx = event.data as usize;
-            let device = devices.get(device_idx).unwrap();
-            while device.has_event_pending() {
-                //TODO: deal with EV_SYN::SYN_DROPPED
-                let (_, event) = device.next_event(evdev_rs::ReadFlag::NORMAL)?;
-                events_buffer.push_back((Instant::now(), device_idx, event));
-            }
-        }
-    }
+        let sim_inst = Instant::now() + Duration::from_millis(ms_delay.into());
+        Ok((sim_inst, event))
+    })?;
+    Ok(())
 }
