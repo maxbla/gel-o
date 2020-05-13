@@ -6,12 +6,18 @@ use std::ffi::OsStr;
 use std::fs::{read_dir, File};
 use std::io;
 use std::os::unix::{ffi::OsStrExt, fs::FileTypeExt, io::AsRawFd, io::RawFd};
+use std::path::Path;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-fn get_all_device_files() -> io::Result<Vec<File>> {
+static DEV_PATH: &str = "/dev/input";
+
+fn get_device_files<T>(path: T) -> io::Result<Vec<File>>
+where
+    T: AsRef<Path>,
+{
     let mut res = Vec::new();
-    for entry in read_dir("/dev/input")? {
+    for entry in read_dir(path)? {
         let entry = entry?;
         // /dev/input files are character devices
         if !entry.file_type()?.is_char_device() {
@@ -62,9 +68,27 @@ pub enum GrabStatus {
     Stop,
 }
 
-pub fn filter_map_events_with_delay_noreturn<F>(mut func:F) -> io::Result<()>
+
+/// returns tuple of epoll_fd, all devices, and uinput devices, where
+/// uinputdevices is the same length as devices, and each uinput device is
+/// a libevdev copy of its corresponding device.
+fn setup_devices() -> io::Result<(RawFd, Vec<Device>, Vec<UInputDevice>)> {
+    let device_files = get_device_files(DEV_PATH)?;
+    let epoll_fd = epoll_watch_all(device_files.iter())?;
+    let devices = device_files
+        .into_iter()
+        .map(|file| Device::new_from_fd(file))
+        .collect::<io::Result<Vec<Device>>>()?;
+    let output_devices = devices
+        .iter()
+        .map(|device| UInputDevice::create_from_device(device))
+        .collect::<io::Result<Vec<UInputDevice>>>()?;
+    Ok((epoll_fd, devices, output_devices))
+}
+
+pub fn filter_map_events_with_delay_noreturn<F>(mut func: F) -> io::Result<()>
 where
-F: FnMut(InputEvent) -> (Instant, Option<InputEvent>)
+    F: FnMut(InputEvent) -> (Instant, Option<InputEvent>),
 {
     filter_map_events_with_delay(|input_event| {
         let (instant, output_event) = func(input_event);
@@ -80,16 +104,7 @@ pub fn filter_map_events_with_delay<F>(mut func: F) -> io::Result<()>
 where
     F: FnMut(InputEvent) -> (Instant, Option<InputEvent>, GrabStatus),
 {
-    let device_files = get_all_device_files()?;
-    let epoll_fd = epoll_watch_all(device_files.iter())?;
-    let mut devices = device_files
-        .into_iter()
-        .map(|file| Device::new_from_fd(file))
-        .collect::<io::Result<Vec<Device>>>()?;
-    let output_devices = devices
-        .iter()
-        .map(|device| UInputDevice::create_from_device(device))
-        .collect::<io::Result<Vec<UInputDevice>>>()?;
+    let (epoll_fd, mut devices, output_devices) = setup_devices()?;
     //grab devices
     let _grab = devices
         .iter_mut()
@@ -97,7 +112,8 @@ where
         .collect::<io::Result<()>>()?;
     // create buffer for epoll to fill
     let mut epoll_buffer = [epoll::Event::new(epoll::Events::empty(), 0); 4];
-    let mut events_buffer = BTreeMap::<Instant, (Option<(Instant, InputEvent, usize)>, GrabStatus)>::new();
+    let mut events_buffer =
+        BTreeMap::<Instant, (Option<(Instant, InputEvent, usize)>, GrabStatus)>::new();
     'event_loop: loop {
         let process_later = events_buffer.split_off(&Instant::now());
         let process_now = events_buffer;
@@ -139,9 +155,7 @@ where
                 //TODO: deal with EV_SYN::SYN_DROPPED
                 let (_, event) = device.next_event(evdev_rs::ReadFlag::NORMAL)?;
                 let (instant, opt_event, grab_status) = func(event);
-                let value = opt_event.map(|event| {
-                    (Instant::now(), event, device_idx)
-                });
+                let value = opt_event.map(|event| (Instant::now(), event, device_idx));
                 if grab_status == GrabStatus::Stop {
                     println!("Stopping Soon...");
                 }
@@ -174,16 +188,7 @@ pub fn filter_map_events<F>(func: F) -> io::Result<()>
 where
     F: Fn(InputEvent) -> (Option<InputEvent>, GrabStatus),
 {
-    let device_files = get_all_device_files()?;
-    let epoll_fd = epoll_watch_all(device_files.iter())?;
-    let mut devices = device_files
-        .into_iter()
-        .map(|file| Device::new_from_fd(file))
-        .collect::<io::Result<Vec<Device>>>()?;
-    let output_devices = devices
-        .iter()
-        .map(|device| UInputDevice::create_from_device(device))
-        .collect::<io::Result<Vec<UInputDevice>>>()?;
+    let (epoll_fd, mut devices, output_devices) = setup_devices()?;
     //grab devices
     let _grab = devices
         .iter_mut()
