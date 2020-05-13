@@ -54,11 +54,22 @@ where
     Ok(epoll_fd)
 }
 
-pub enum GrabErr {
+#[derive(Debug, Eq, PartialEq, Hash)]
+pub enum GrabStatus {
     /// ignore event
-    DontSimulate,
+    Continue,
     /// ungrab events
     Stop,
+}
+
+pub fn filter_map_events_with_delay_noreturn<F>(mut func:F) -> io::Result<()>
+where
+F: FnMut(InputEvent) -> (Instant, Option<InputEvent>)
+{
+    filter_map_events_with_delay(|input_event| {
+        let (instant, output_event) = func(input_event);
+        (instant, output_event, GrabStatus::Continue)
+    })
 }
 
 // apply function to all InputEvents
@@ -67,7 +78,7 @@ pub enum GrabErr {
 // is discarded. Otherwise, the event is simulated.
 pub fn filter_map_events_with_delay<F>(mut func: F) -> io::Result<()>
 where
-    F: FnMut(InputEvent) -> Result<(Instant, InputEvent), GrabErr>,
+    F: FnMut(InputEvent) -> (Instant, Option<InputEvent>, GrabStatus),
 {
     let device_files = get_all_device_files()?;
     let epoll_fd = epoll_watch_all(device_files.iter())?;
@@ -86,18 +97,23 @@ where
         .collect::<io::Result<()>>()?;
     // create buffer for epoll to fill
     let mut epoll_buffer = [epoll::Event::new(epoll::Events::empty(), 0); 4];
-    let mut events_buffer = BTreeMap::<Instant, (Instant, InputEvent, usize)>::new();
+    let mut events_buffer = BTreeMap::<Instant, (Option<(Instant, InputEvent, usize)>, GrabStatus)>::new();
     'event_loop: loop {
         let process_later = events_buffer.split_off(&Instant::now());
         let process_now = events_buffer;
         events_buffer = process_later;
-        for (recieved_inst, event, idx) in process_now.values() {
-            println!(
-                "Actual time waited: {}",
-                recieved_inst.elapsed().as_millis()
-            );
-            let output_device = output_devices.get(*idx).unwrap();
-            output_device.write_event(event).unwrap();
+        for (opt, grab_status) in process_now.values() {
+            opt.into_iter().for_each(|(recieved_inst, event, idx)| {
+                println!(
+                    "Actual time waited: {}",
+                    recieved_inst.elapsed().as_millis()
+                );
+                let output_device = output_devices.get(*idx).unwrap();
+                output_device.write_event(event).unwrap();
+            });
+            if grab_status == &GrabStatus::Stop {
+                break 'event_loop;
+            }
         }
         //wait until new events need to be processed or new events arrive
         let wait_ms: i32 = events_buffer
@@ -122,15 +138,14 @@ where
             while device.has_event_pending() {
                 //TODO: deal with EV_SYN::SYN_DROPPED
                 let (_, event) = device.next_event(evdev_rs::ReadFlag::NORMAL)?;
-                match func(event) {
-                    Ok((instant, event)) => {
-                        events_buffer.insert(instant, (Instant::now(), event, device_idx));
-                    }
-                    Err(err) => match err {
-                        GrabErr::Stop => break 'event_loop,
-                        _ => {}
-                    },
+                let (instant, opt_event, grab_status) = func(event);
+                let value = opt_event.map(|event| {
+                    (Instant::now(), event, device_idx)
+                });
+                if grab_status == GrabStatus::Stop {
+                    println!("Stopping Soon...");
                 }
+                events_buffer.insert(instant, (value, grab_status));
             }
         }
     }
@@ -145,9 +160,19 @@ where
     Ok(())
 }
 
+pub fn filter_map_events_noreturn<F>(func: F) -> io::Result<()>
+where
+    F: Fn(InputEvent) -> Option<InputEvent>,
+{
+    filter_map_events(|input_event| {
+        let output_event = func(input_event);
+        (output_event, GrabStatus::Continue)
+    })
+}
+
 pub fn filter_map_events<F>(func: F) -> io::Result<()>
 where
-    F: Fn(InputEvent) -> Result<InputEvent, GrabErr>,
+    F: Fn(InputEvent) -> (Option<InputEvent>, GrabStatus),
 {
     let device_files = get_all_device_files()?;
     let epoll_fd = epoll_watch_all(device_files.iter())?;
@@ -175,15 +200,15 @@ where
             while device.has_event_pending() {
                 //TODO: deal with EV_SYN::SYN_DROPPED
                 let (_, event) = device.next_event(evdev_rs::ReadFlag::NORMAL)?;
-                match func(event) {
-                    Ok(event) => output_devices
+                let (event, grab_status) = func(event);
+                for event in event.into_iter() {
+                    output_devices
                         .get(device_idx)
                         .unwrap()
-                        .write_event(&event)?,
-                    Err(err) => match err {
-                        GrabErr::Stop => break 'event_loop,
-                        _ => {}
-                    },
+                        .write_event(&event)?
+                }
+                if grab_status == GrabStatus::Stop {
+                    break 'event_loop;
                 }
             }
         }
@@ -207,14 +232,29 @@ fn main() -> Result<(), Box<dyn Error>> {
     //wait for enter key to be released after starting
     sleep(Duration::from_millis(500));
 
+    // println!("Waiting for enter to be released");
+    // filter_map_events(|event| {
+    //     match event {
+    //         evdev_rs::InputEvent{time:_,
+    //             event_type:evdev_rs::EventType::EV_KEY,
+    //             event_code:evdev_rs::EventCode::EV_KEY(evdev_rs::EV_KEY::KEY_ENTER),
+    //             value:1
+    //         } => {
+    //             (Some(event), GrabStatus::Stop)
+    //         }
+    //         _ => (Some(event), GrabStatus::Continue)
+    //     }
+    // })?;
+    // println!("Enter has been released");
+
     let mut event_count = 0;
     filter_map_events_with_delay(move |event| {
         event_count += 1;
-        if event_count > 100 {
-            return Err(GrabErr::Stop);
+        if event_count == 10000 {
+            return (Instant::now(), None, GrabStatus::Stop);
         }
         let sim_inst = Instant::now() + Duration::from_millis(ms_delay.into());
-        Ok((sim_inst, event))
+        (sim_inst, Some(event), GrabStatus::Continue)
     })?;
     Ok(())
 }
