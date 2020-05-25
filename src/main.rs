@@ -88,7 +88,7 @@ fn setup_devices() -> io::Result<(RawFd, Vec<Device>, Vec<UInputDevice>)> {
 
 pub fn filter_map_events_with_delay_noreturn<F>(mut func: F) -> io::Result<()>
 where
-    F: FnMut(InputEvent) -> (Instant, Option<InputEvent>),
+    F: FnMut(InputEvent) -> (Instant, Option<InputEvent>)
 {
     filter_map_events_with_delay(|input_event| {
         let (instant, output_event) = func(input_event);
@@ -96,10 +96,11 @@ where
     })
 }
 
-// apply function to all InputEvents
-// Function takes InputEvent as input and returns a Result of tuple of (time at
-// which to simulate input, event to simulate). If the Result is Err, the event
-// is discarded. Otherwise, the event is simulated.
+/// Similar to Iterator's filter_map
+///
+/// Filter and transform events, additionally specifying an Instant at which
+/// to simulate the transformed event. To stop grabbing, return
+/// `GrabStatus::Stop`
 pub fn filter_map_events_with_delay<F>(mut func: F) -> io::Result<()>
 where
     F: FnMut(InputEvent) -> (Instant, Option<InputEvent>, GrabStatus),
@@ -128,6 +129,7 @@ where
                 output_device.write_event(event).unwrap();
             });
             if grab_status == &GrabStatus::Stop {
+                println!("Stopping Now.");
                 break 'event_loop;
             }
         }
