@@ -120,14 +120,14 @@ where
         let process_now = events_buffer;
         events_buffer = process_later;
         for (opt, grab_status) in process_now.values() {
-            opt.into_iter().for_each(|(recieved_inst, event, idx)| {
+            for (recieved_inst, event, idx) in opt {
                 println!(
                     "Actual time waited: {}",
                     recieved_inst.elapsed().as_millis()
                 );
                 let output_device = output_devices.get(*idx).unwrap();
-                output_device.write_event(event).unwrap();
-            });
+                output_device.write_event(event)?;
+            }
             if grab_status == &GrabStatus::Stop {
                 println!("Stopping Now.");
                 break 'event_loop;
