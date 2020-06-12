@@ -9,3 +9,4 @@ edition = "2018"
 [dependencies]
 evdev-rs = "0.4.0"
 epoll = "4.1.0"
+inotify = "0.8.2"
