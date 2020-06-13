@@ -12,9 +12,11 @@ use std::os::unix::{
     io::{AsRawFd, IntoRawFd, RawFd},
 };
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 static DEV_PATH: &str = "/dev/input";
+const INOTIFY_DATA: u64 = u64::max_value();
+const EPOLLIN: epoll::Events = epoll::Events::EPOLLIN;
 
 fn get_device_files<T>(path: T) -> io::Result<Vec<File>>
 where
@@ -60,7 +62,7 @@ where
     let epoll_fd = epoll::create(true)?;
     // add file descriptors to epoll
     for (file_idx, file) in device_files.enumerate() {
-        let epoll_event = epoll::Event::new(epoll::Events::EPOLLIN, file_idx as u64);
+        let epoll_event = epoll::Event::new(EPOLLIN, file_idx as u64);
         epoll::ctl(epoll_fd, EPOLL_CTL_ADD, file.as_raw_fd(), epoll_event)?;
     }
     Ok(epoll_fd)
@@ -84,8 +86,8 @@ pub fn add_device_to_epoll_from_inotify_event(
     let file = File::open(device_path)?;
     let fd = file.as_raw_fd();
     let device = Device::new_from_fd(file)?;
+    let event = epoll::Event::new(EPOLLIN, devices.len() as u64);
     devices.push(device);
-    let event = epoll::Event::new(epoll::Events::EPOLLIN, devices.len() as u64 - 1);
     epoll::ctl(epoll_fd, EPOLL_CTL_ADD, fd, event)?;
     Ok(())
 }
@@ -98,7 +100,7 @@ pub enum GrabStatus {
     Stop,
 }
 
-/// returns tuple of epoll_fd, all devices, and uinput devices, where
+/// Returns tuple of epoll_fd, all devices, and uinput devices, where
 /// uinputdevices is the same length as devices, and each uinput device is
 /// a libevdev copy of its corresponding device.The epoll_fd is level-triggered
 /// on any available data in the original devices.
@@ -116,6 +118,24 @@ fn setup_devices() -> io::Result<(RawFd, Vec<Device>, Vec<UInputDevice>)> {
     Ok((epoll_fd, devices, output_devices))
 }
 
+/// Creates an inotify instance looking at /dev/input and adds it to an epoll instance.
+/// Ensures devices isnt too long, which would make the epoll data ambigious.
+fn setup_inotify(epoll_fd: RawFd, devices: &Vec<Device>) -> io::Result<Inotify> {
+        //Ensure there is space for inotify at last epoll index.
+        if u64::try_from(devices.len()).unwrap_or(u64::max_value()) >= INOTIFY_DATA {
+            eprintln!("number of devices: {}", devices.len());
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "too many device files!",
+            ))?
+        }
+        // Set up inotify to listen for new devices being plugged in
+        let inotify = inotify_devices()?;
+        let epoll_event = epoll::Event::new(EPOLLIN, INOTIFY_DATA);
+        epoll::ctl(epoll_fd, EPOLL_CTL_ADD, inotify.as_raw_fd(), epoll_event)?;
+        Ok(inotify)
+}
+
 pub fn filter_map_events_with_delay_noreturn<F>(mut func: F) -> io::Result<()>
 where
     F: FnMut(InputEvent) -> (Instant, Option<InputEvent>),
@@ -126,7 +146,7 @@ where
     })
 }
 
-/// Similar to Iterator's filter_map
+/// Similar to Iterator's filter_map, only this blocks
 ///
 /// Filter and transform events, additionally specifying an Instant at which
 /// to simulate the transformed event. To stop grabbing, return
@@ -136,19 +156,7 @@ where
     F: FnMut(InputEvent) -> (Instant, Option<InputEvent>, GrabStatus),
 {
     let (epoll_fd, mut devices, output_devices) = setup_devices()?;
-
-    //Ensure there is space for inotify at last epoll index.
-    if u64::try_from(devices.len()).unwrap_or(u64::max_value()) >= u64::max_value() {
-        eprintln!("number of devices: {}", devices.len());
-        Err(io::Error::new(
-            io::ErrorKind::Other,
-            "too many device files!",
-        ))?
-    }
-    // Set up inotify to listen for new devices being plugged in
-    let mut inotify = inotify_devices()?;
-    let epoll_event = epoll::Event::new(epoll::Events::EPOLLIN, u64::max_value());
-    epoll::ctl(epoll_fd, EPOLL_CTL_ADD, inotify.as_raw_fd(), epoll_event)?;
+    let mut inotify = setup_inotify(epoll_fd, &devices)?;
 
     //grab devices
     let _grab = devices
@@ -188,8 +196,8 @@ where
                 sim_inst
                     .checked_duration_since(Instant::now())
                     .unwrap_or_default()
-                    .checked_add(Duration::from_millis(1))?
                     .as_millis()
+                    .checked_add(1)?
                     .try_into()
                     .ok()
             })
@@ -198,14 +206,12 @@ where
         let num_events = epoll::wait(epoll_fd, wait_ms, &mut epoll_buffer)?;
         //add new events to queue
         'events: for event in epoll_buffer.get(0..num_events).unwrap() {
-            //inotify - new device file created
-            if event.data == u64::max_value() {
+            // new device file created
+            if event.data == INOTIFY_DATA {
                 for event in inotify.read_events(&mut inotify_buffer)? {
-                    if event.mask.contains(inotify::EventMask::CREATE) {
-                        add_device_to_epoll_from_inotify_event(epoll_fd, event, &mut devices)?;
-                    } else {
-                        unreachable!("inotify is listening for events other than file creation")
-                    }
+                    assert!(event.mask.contains(inotify::EventMask::CREATE),
+                        "inotify is listening for events other than file creation");
+                    add_device_to_epoll_from_inotify_event(epoll_fd, event, &mut devices)?;
                 }
             } else {
                 // Input device recieved event
@@ -216,13 +222,9 @@ where
                     let (_, event) = match device.next_event(evdev_rs::ReadFlag::NORMAL) {
                         Ok(event) => event,
                         Err(_) => {
-                            let device_file = device.fd().unwrap();
-                            epoll::ctl(
-                                epoll_fd,
-                                EPOLL_CTL_DEL,
-                                device_file.into_raw_fd(),
-                                epoll::Event::new(epoll::Events::empty(), 0),
-                            )?;
+                            let device_fd = device.fd().unwrap().into_raw_fd();
+                            let empty_event = epoll::Event::new(epoll::Events::empty(), 0);
+                            epoll::ctl(epoll_fd, EPOLL_CTL_DEL, device_fd, empty_event)?;
                             continue 'events;
                         }
                     };
@@ -258,18 +260,7 @@ where
     F: FnMut(InputEvent) -> (Option<InputEvent>, GrabStatus),
 {
     let (epoll_fd, mut devices, output_devices) = setup_devices()?;
-    //Ensure there is space for inotify at last epoll index.
-    if u64::try_from(devices.len()).unwrap_or(u64::max_value()) >= u64::max_value() {
-        eprintln!("number of devices: {}", devices.len());
-        Err(io::Error::new(
-            io::ErrorKind::Other,
-            "too many device files!",
-        ))?
-    }
-    // Set up inotify to listen for new devices being plugged in
-    let mut inotify = inotify_devices()?;
-    let epoll_event = epoll::Event::new(epoll::Events::EPOLLIN, u64::max_value());
-    epoll::ctl(epoll_fd, EPOLL_CTL_ADD, inotify.as_raw_fd(), epoll_event)?;
+    let mut inotify = setup_inotify(epoll_fd, &devices)?;
 
     //grab devices
     let _grab = devices
@@ -284,14 +275,12 @@ where
 
         //map and simulate events, dealing with
         'events: for event in &epoll_buffer[0..num_events] {
-            //inotify - new device file created
-            if event.data == u64::max_value() {
+            // new device file created
+            if event.data == INOTIFY_DATA {
                 for event in inotify.read_events(&mut inotify_buffer)? {
-                    if event.mask.contains(inotify::EventMask::CREATE) {
-                        add_device_to_epoll_from_inotify_event(epoll_fd, event, &mut devices)?;
-                    } else {
-                        unreachable!("inotify is listening for events other than file creation")
-                    }
+                    assert!(event.mask.contains(inotify::EventMask::CREATE),
+                        "inotify is listening for events other than file creation");
+                    add_device_to_epoll_from_inotify_event(epoll_fd, event, &mut devices)?;
                 }
             } else {
                 // Input device recieved event
@@ -302,21 +291,16 @@ where
                     let (_, event) = match device.next_event(evdev_rs::ReadFlag::NORMAL) {
                         Ok(event) => event,
                         Err(_) => {
-                            let device_file = device.fd().unwrap();
-                            epoll::ctl(
-                                epoll_fd,
-                                EPOLL_CTL_DEL,
-                                device_file.into_raw_fd(),
-                                epoll::Event::new(epoll::Events::empty(), 0),
-                            )?;
+                            let device_fd = device.fd().unwrap().into_raw_fd();
+                            let empty_event = epoll::Event::new(epoll::Events::empty(), 0);
+                            epoll::ctl(epoll_fd, EPOLL_CTL_DEL, device_fd, empty_event)?;
                             continue 'events;
                         }
                     };
                     let (event, grab_status) = func(event);
-                    for event in event.into_iter() {
-                        for out_device in output_devices.get(device_idx).into_iter() {
-                            out_device.write_event(&event)?;
-                        }
+                    match (event, output_devices.get(device_idx)) {
+                        (Some(event), Some(out_device)) => out_device.write_event(&event)?,
+                        _ => {}
                     }
                     if grab_status == GrabStatus::Stop {
                         break 'event_loop;

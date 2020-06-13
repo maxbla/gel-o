@@ -1,7 +1,7 @@
-use std::thread::sleep;
-use std::error::Error;
-use std::time::{Duration, Instant};
 use libgelo::{filter_map_events_with_delay, GrabStatus};
+use std::error::Error;
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
