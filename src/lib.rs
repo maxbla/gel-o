@@ -95,7 +95,7 @@ pub fn add_device_to_epoll_from_inotify_event(
 #[derive(Debug, Eq, PartialEq, Hash)]
 pub enum GrabStatus {
     /// ignore event
-    Continue,
+    Ungrab,
     /// ungrab events
     Stop,
 }
@@ -142,7 +142,7 @@ where
 {
     filter_map_events_with_delay(|input_event| {
         let (instant, output_event) = func(input_event);
-        (instant, output_event, GrabStatus::Continue)
+        (instant, output_event, GrabStatus::Ungrab)
     })
 }
 
@@ -251,7 +251,7 @@ where
 {
     filter_map_events(|input_event| {
         let output_event = func(input_event);
-        (output_event, GrabStatus::Continue)
+        (output_event, GrabStatus::Ungrab)
     })
 }
 
