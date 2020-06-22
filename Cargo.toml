@@ -1,14 +1,17 @@
 [package]
 name = "gel-o"
-version = "0.1.0"
+version = "0.0.1"
 authors = ["Max Blachman <blachmanmax@gmail.com>"]
 edition = "2018"
 
 [lib]
-name = "libgelo"
+name = "gelo"
 path = "src/lib.rs"
 
 [dependencies]
 evdev-rs = "0.4.0"
 epoll = "4.1.0"
-inotify = "0.8.2"
+inotify = {version = "0.8.2", default-features=false}
+
+[badges]
+maintenance = { status = "experimental" }

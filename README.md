@@ -1,6 +1,12 @@
 # Gel-O
 
-Gel-o makes your computer feel like Jell-O, by delaying all user input by a configurable number of milliseconds
+Gel-O is a library for manipulating user-input in Linux.
+
+Gel-O can make your computer feel like Jell-O, by delaying all user input by a configurable number of milliseconds (and in various other ways).
+
+# Stability
+
+Gel-O is experimental. Expect many breaking changes to come.
 
 ## Why?
 
@@ -27,9 +33,13 @@ BSD support may be easy to add, as evdev was recently added to some BSD kernels
 ## Features
 
 - Configurable delay
-- Works on Xorg, Wayland, and linux virtual terminal
+- Works on Xorg, Wayland, and the Linux virtual terminal
 - Runs smoothly on low power devices like raspberry pi due to efficient epoll-based architecture
-- Works with all inputs including mice, keyboards, power buttons, gamepads and flight sticks
+- Works with every input device Linux does including mice, keyboards, power buttons, gamepads, flight sticks and more
+
+## Anti-features
+
+- Requires read/write access to files in /dev/input, /dev/uinput
 
 ## How to use
 
@@ -39,15 +49,14 @@ git clone [this repo]
 ```
 Compile the source. You need a rust toolchain and cargo.
 ```
-cargo build --release
+cargo build --release --example delay
 ```
 Run the produced binary with root privledges
 ```
-sudo ./target/release/gel-o [number of ms to delay]
+sudo ./target/release/examples/delay [number of ms to delay]
 ```
 
 ## TODO
-- monitor filesystem for new devices, and add delay to them too (probably using inotify)
-- add tests
-### Stretch
-- Create serializable event struct that can get around ownership issues with libevdev
+- [x] monitor filesystem for new devices, and add delay to them too (probably using inotify)
+- [ ] add tests
+- [ ] Create serializable event struct that sidesteps ownership issues with libevdev
