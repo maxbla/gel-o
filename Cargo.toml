@@ -2,7 +2,11 @@
 name = "gel-o"
 version = "0.0.1"
 authors = ["Max Blachman <blachmanmax@gmail.com>"]
+description = "Run a closure on Linux InputEvents"
 edition = "2018"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/maxbla/gel-o"
+readme = "README.md"
 
 [lib]
 name = "gelo"
