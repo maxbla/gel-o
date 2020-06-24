@@ -30,7 +30,7 @@ fn main() -> std::io::Result<()> {
             (Instant::now(), None, GrabStatus::Stop)
         } else {
             let sim_inst = Instant::now() + Duration::from_millis(ms_delay.into());
-            (sim_inst, Some(event), GrabStatus::Ungrab)
+            (sim_inst, Some(event), GrabStatus::Continue)
         }
     })?;
     Ok(())

@@ -23,7 +23,7 @@ fn main() -> std::io::Result<()> {
         if event_count >= 10000 {
             (None, GrabStatus::Stop)
         } else {
-            (Some(event), GrabStatus::Ungrab)
+            (Some(event), GrabStatus::Continue)
         }
     })?;
 

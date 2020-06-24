@@ -18,6 +18,16 @@ static DEV_PATH: &str = "/dev/input";
 const INOTIFY_DATA: u64 = u64::max_value();
 const EPOLLIN: epoll::Events = epoll::Events::EPOLLIN;
 
+/// Whether to continue grabbing events or to stop
+/// Used in `filter_map_events` (and others)
+#[derive(Debug, Eq, PartialEq, Hash)]
+pub enum GrabStatus {
+    /// Stop grabbing 
+    Continue,
+    /// ungrab events
+    Stop,
+}
+
 fn get_device_files<T>(path: T) -> io::Result<Vec<File>>
 where
     T: AsRef<Path>,
@@ -92,14 +102,6 @@ pub fn add_device_to_epoll_from_inotify_event(
     Ok(())
 }
 
-#[derive(Debug, Eq, PartialEq, Hash)]
-pub enum GrabStatus {
-    /// ignore event
-    Ungrab,
-    /// ungrab events
-    Stop,
-}
-
 /// Returns tuple of epoll_fd, all devices, and uinput devices, where
 /// uinputdevices is the same length as devices, and each uinput device is
 /// a libevdev copy of its corresponding device.The epoll_fd is level-triggered
@@ -136,17 +138,19 @@ fn setup_inotify(epoll_fd: RawFd, devices: &Vec<Device>) -> io::Result<Inotify> 
         Ok(inotify)
 }
 
+// TODO: return the never type, `!` when it is stabalized
+/// Like `filter_map_events_with_delay`, only never returns
 pub fn filter_map_events_with_delay_noreturn<F>(mut func: F) -> io::Result<()>
 where
     F: FnMut(InputEvent) -> (Instant, Option<InputEvent>),
 {
     filter_map_events_with_delay(|input_event| {
         let (instant, output_event) = func(input_event);
-        (instant, output_event, GrabStatus::Ungrab)
+        (instant, output_event, GrabStatus::Continue)
     })
 }
 
-/// Similar to Iterator's filter_map, only this blocks
+/// Similar to Iterator's filter_map, only this blocks waiting for input
 ///
 /// Filter and transform events, additionally specifying an Instant at which
 /// to simulate the transformed event. To stop grabbing, return
@@ -245,16 +249,21 @@ where
     Ok(())
 }
 
+// TODO: return the never type, `!` when it is stabalized
+/// Like `filter_map_events`, only never returns
 pub fn filter_map_events_noreturn<F>(func: F) -> io::Result<()>
 where
     F: Fn(InputEvent) -> Option<InputEvent>,
 {
     filter_map_events(|input_event| {
         let output_event = func(input_event);
-        (output_event, GrabStatus::Ungrab)
+        (output_event, GrabStatus::Continue)
     })
 }
 
+/// Similar to Iterator's filter_map, only this blocks waiting for input
+///
+/// Filter and transform events. To stop grabbing, return `GrabStatus::Stop`
 pub fn filter_map_events<F>(mut func: F) -> io::Result<()>
 where
     F: FnMut(InputEvent) -> (Option<InputEvent>, GrabStatus),
