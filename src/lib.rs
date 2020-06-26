@@ -1,6 +1,7 @@
+pub use evdev_rs;
+
 use epoll::ControlOptions::{EPOLL_CTL_ADD, EPOLL_CTL_DEL};
-pub use evdev_rs::InputEvent;
-use evdev_rs::{Device, UInputDevice};
+use evdev_rs::{Device, UInputDevice, InputEvent};
 use inotify::{Inotify, WatchMask};
 use std::collections::BTreeMap;
 use std::convert::{TryFrom, TryInto};
