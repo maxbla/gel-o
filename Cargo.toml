@@ -1,6 +1,6 @@
 [package]
 name = "gel-o"
-version = "0.0.2"
+version = "0.0.3"
 authors = ["Max Blachman <blachmanmax@gmail.com>"]
 description = "Run a closure on Linux InputEvents"
 edition = "2018"

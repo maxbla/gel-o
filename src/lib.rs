@@ -1,5 +1,6 @@
 use epoll::ControlOptions::{EPOLL_CTL_ADD, EPOLL_CTL_DEL};
-use evdev_rs::{Device, InputEvent, UInputDevice};
+pub use evdev_rs::InputEvent;
+use evdev_rs::{Device, UInputDevice};
 use inotify::{Inotify, WatchMask};
 use std::collections::BTreeMap;
 use std::convert::{TryFrom, TryInto};
@@ -84,7 +85,7 @@ fn inotify_devices() -> io::Result<Inotify> {
     Ok(inotify)
 }
 
-pub fn add_device_to_epoll_from_inotify_event(
+fn add_device_to_epoll_from_inotify_event(
     epoll_fd: RawFd,
     event: inotify::Event<&OsStr>,
     devices: &mut Vec<Device>,
