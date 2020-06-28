@@ -1,7 +1,7 @@
+use evdev_rs::enums::{EventCode, EV_KEY};
 /// Make your QWERTY keyboard act like a DVORAK...
 /// the wrong way
 use evdev_rs::InputEvent;
-use evdev_rs::enums::{EventCode, EV_KEY};
 use gelo::{filter_map_events, GrabStatus};
 
 fn qwerty_to_dvorak(event: InputEvent) -> InputEvent {
@@ -43,11 +43,14 @@ fn qwerty_to_dvorak(event: InputEvent) -> InputEvent {
                 EV_KEY::KEY_COMMA => EV_KEY::KEY_W,
                 EV_KEY::KEY_DOT => EV_KEY::KEY_V,
                 EV_KEY::KEY_SLASH => EV_KEY::KEY_Z,
-                _ => key
+                _ => key,
             };
-            InputEvent{event_code: EventCode::EV_KEY(key), ..event}
-        },
-        _ => event
+            InputEvent {
+                event_code: EventCode::EV_KEY(key),
+                ..event
+            }
+        }
+        _ => event,
     }
 }
 

@@ -1,9 +1,9 @@
 use gelo::{filter_map_events_with_delay, GrabStatus};
+use std::env;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
-use std::env;
 
-const DEFAULT_MS_DELAY:u32 = 60;
+const DEFAULT_MS_DELAY: u32 = 60;
 
 fn main() -> std::io::Result<()> {
     let ms_delay = env::args().nth(1).map(|arg| arg.parse().unwrap());
@@ -26,7 +26,7 @@ fn main() -> std::io::Result<()> {
     filter_map_events_with_delay(move |event| {
         event_count += 1;
         // Ensure system doesn't become unusable by ungrabbing after many events
-        if event_count == 10000 {
+        if event_count >= 10000 {
             (Instant::now(), None, GrabStatus::Stop)
         } else {
             let sim_inst = Instant::now() + Duration::from_millis(ms_delay.into());

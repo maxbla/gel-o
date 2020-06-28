@@ -1,7 +1,7 @@
+use evdev_rs::enums::EventType;
 use gelo::{filter_map_events, GrabStatus};
 use std::thread::sleep;
 use std::time::Duration;
-use evdev_rs::enums::EventType;
 
 /// Inverts all "relative" motion
 /// For example mouse motion is relative, scroll wheeling is relative
