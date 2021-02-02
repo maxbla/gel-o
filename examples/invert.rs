@@ -1,5 +1,5 @@
 use evdev_rs::enums::EventType;
-use gelo::{filter_map_events, GrabStatus};
+use gelo::EventsListener;
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -13,19 +13,16 @@ fn main() -> std::io::Result<()> {
     // TODO: remove this hack
     sleep(Duration::from_millis(500));
 
-    let mut event_count = 0;
-    filter_map_events(move |mut event| {
-        if event.event_type == EventType::EV_REL {
+    let mut listener = EventsListener::new(true)?;
+    for (mut event, device) in listener.iter().take(1) {
+        if event.event_type() == Some(EventType::EV_REL) {
             event.value *= -1;
         }
-        event_count += 1;
-        // Ensure system doesn't become unusable by ungrabbing after many events
-        if event_count >= 10000 {
-            (None, GrabStatus::Stop)
-        } else {
-            (Some(event), GrabStatus::Continue)
-        }
-    })?;
+        #[cfg(feature = "arc")]
+        device.lock().unwrap().write_event(&event)?;
+        #[cfg(not(feature = "arc"))]
+        device.write_event(&event)?;
+    }
 
     Ok(())
 }
