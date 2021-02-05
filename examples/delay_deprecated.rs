@@ -1,3 +1,4 @@
+#[allow(deprecated)]
 use gelo::{filter_map_events_with_delay, GrabStatus};
 use std::env;
 use std::thread::sleep;
@@ -25,6 +26,7 @@ fn main() -> std::io::Result<()> {
     sleep(Duration::from_millis(500));
 
     let mut event_count = 0;
+    #[allow(deprecated)]
     filter_map_events_with_delay(move |event| {
         event_count += 1;
         // Ensure system doesn't become unusable by ungrabbing after many events

@@ -3,26 +3,24 @@ pub use evdev_rs;
 use epoll::ControlOptions::{EPOLL_CTL_ADD, EPOLL_CTL_DEL};
 use evdev_rs::{Device, InputEvent, ReadFlag, UInputDevice};
 use inotify::{EventMask, Inotify, WatchMask};
-use std::convert::{TryFrom, TryInto};
-use std::ffi::{CString, OsStr, OsString};
-use std::fs::{read_dir, File};
-use std::io;
 use std::os::unix::{
     ffi::OsStrExt,
     fs::FileTypeExt,
     io::{AsRawFd, FromRawFd, RawFd},
 };
-use std::path::Path;
 #[cfg(feature = "arc")]
 use std::sync::Mutex;
 use std::{
     collections::{BTreeMap, HashMap},
-    path::PathBuf,
+    convert::TryInto,
+    ffi::{CString, OsStr, OsString},
+    fs::{read_dir, File},
+    io,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 static DEV_PATH: &str = "/dev/input";
-const INOTIFY_DATA: u64 = u64::max_value();
 const EPOLLIN: epoll::Events = epoll::Events::EPOLLIN;
 
 #[cfg(feature = "arc")]
@@ -86,7 +84,7 @@ impl EventsListener {
     /// only mouse input (in the event of a bug, you can press ctrl+c or even
     /// switch to the linux virtual terminal with ctrl+alt+F6 then use kill/htop)
     pub fn new_with_filter(grab: bool, filter: DeviceFilter) -> io::Result<EventsListener> {
-        let (epoll_fd, devices) = setup_devices_2(filter)?;
+        let (epoll_fd, devices) = setup_devices(filter)?;
         let mut devices: HashMap<u64, _> = devices
             .into_iter()
             .map(|(idx, ((path, dev), (ui_path, ui_dev)))| {
@@ -96,7 +94,8 @@ impl EventsListener {
                 (idx, ((path, dev), (ui_path, Ptr::new(ui_dev))))
             })
             .collect();
-        let inotify = setup_inotify_2()?;
+        let mut inotify = Inotify::init()?;
+        inotify.add_watch(DEV_PATH, WatchMask::CREATE | WatchMask::DELETE)?;
 
         if grab {
             for ((_, device), _) in devices.values_mut() {
@@ -136,7 +135,7 @@ impl EventsListener {
             .get(&device_idx)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "index out of range"))?
             .1
-            .1
+             .1
             .clone();
         #[cfg(feature = "arc")]
         output_device
@@ -264,14 +263,13 @@ impl<'a> InputIter<'a> {
                         let idx = &mut self.listener.idx;
                         let event = epoll::Event::new(EPOLLIN, *idx);
                         #[cfg(not(feature = "arc"))]
-                        self.listener.devices.insert(
-                            *idx,
-                            ((path, device), (ui_path, Ptr::new(out_device)))
-                        );
+                        self.listener
+                            .devices
+                            .insert(*idx, ((path, device), (ui_path, Ptr::new(out_device))));
                         #[cfg(feature = "arc")]
                         self.listener.devices.insert(
-                            *idx, ((path, device),
-                            (ui_path, Ptr::new(Mutex::new(out_device))))
+                            *idx,
+                            ((path, device), (ui_path, Ptr::new(Mutex::new(out_device)))),
                         );
                         *idx += 1;
                         epoll::ctl(self.listener.epoll_fd, EPOLL_CTL_ADD, fd, event)?;
@@ -405,40 +403,6 @@ fn get_device_paths<T: AsRef<Path>>(path: T) -> io::Result<Vec<PathBuf>> {
     Ok(res)
 }
 
-fn epoll_watch_all<'a, T>(device_files: T) -> io::Result<RawFd>
-where
-    T: Iterator<Item = &'a File>,
-{
-    let epoll_fd = epoll::create(true)?;
-    // add file descriptors to epoll
-    for (file_idx, file) in device_files.enumerate() {
-        let epoll_event = epoll::Event::new(EPOLLIN, file_idx as u64);
-        epoll::ctl(epoll_fd, EPOLL_CTL_ADD, file.as_raw_fd(), epoll_event)?;
-    }
-    Ok(epoll_fd)
-}
-
-fn add_device_to_epoll_from_inotify_event(
-    epoll_fd: RawFd,
-    event: inotify::Event<&OsStr>,
-    devices: &mut Vec<Device>,
-    grab: bool,
-) -> io::Result<()> {
-    let maybe_device = get_device_from_inotify_event(event);
-    let (_path, mut device) = match maybe_device {
-        None => return Ok(()), //do nothing
-        Some(device) => device?,
-    };
-    if grab {
-        device.grab(evdev_rs::GrabMode::Grab)?;
-    }
-    let fd = device.file().as_raw_fd();
-    let event = epoll::Event::new(EPOLLIN, devices.len() as u64);
-    devices.push(device);
-    epoll::ctl(epoll_fd, EPOLL_CTL_ADD, fd, event)?;
-    Ok(())
-}
-
 fn get_device_from_inotify_event(
     event: inotify::Event<&OsStr>,
 ) -> Option<io::Result<(PathBuf, Device)>> {
@@ -476,27 +440,6 @@ fn get_device_from_inotify_event(
     Some(Device::new_from_file(file).map(|device| (device_path, device)))
 }
 
-/// Returns tuple of epoll_fd, all devices, and uinput devices, where
-/// uinputdevices is the same length as devices, and each uinput device is
-/// a libevdev copy of its corresponding device.The epoll_fd is level-triggered
-/// on any available data in the original devices.
-fn setup_devices() -> io::Result<(RawFd, Vec<Device>, Vec<UInputDevice>)> {
-    let device_files = get_device_paths(DEV_PATH)?
-        .into_iter()
-        .map(File::open)
-        .collect::<io::Result<Vec<File>>>()?;
-    let epoll_fd = epoll_watch_all(device_files.iter())?;
-    let devices = device_files
-        .into_iter()
-        .map(Device::new_from_file)
-        .collect::<io::Result<Vec<Device>>>()?;
-    let output_devices = devices
-        .iter()
-        .map(|device| UInputDevice::create_from_device(device))
-        .collect::<io::Result<Vec<UInputDevice>>>()?;
-    Ok((epoll_fd, devices, output_devices))
-}
-
 /// Open an fd with O_RDONLY | O_NONBLOCK
 fn open_file_nonblock<P: AsRef<OsStr>>(path: P) -> io::Result<File> {
     let path = CString::new(path.as_ref().as_bytes())
@@ -517,7 +460,7 @@ fn open_file_nonblock<P: AsRef<OsStr>>(path: P) -> io::Result<File> {
 /// Returns tuple of epoll_fd and a hashmap containing a device and a
 /// UInputDevice that any events read from the device can be simulated on.
 /// The epoll_fd is level-triggered on the device file.
-fn setup_devices_2(
+fn setup_devices(
     include: DeviceFilter,
 ) -> io::Result<(
     RawFd,
@@ -548,33 +491,6 @@ fn setup_devices_2(
     Ok((epoll_fd, ret))
 }
 
-/// Creates an inotify instance looking at /dev/input and adds it to an epoll instance.
-/// Ensures devices isnt too long, which would make the epoll data ambigious.
-fn setup_inotify(epoll_fd: RawFd, devices: &[Device]) -> io::Result<Inotify> {
-    //Ensure there is space for inotify at last epoll index.
-    if u64::try_from(devices.len()).unwrap_or(std::u64::MAX) == INOTIFY_DATA {
-        eprintln!("number of devices: {}", devices.len());
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "too many device files!",
-        ));
-    }
-    // Set up inotify to listen for new devices being plugged in
-    let mut inotify = Inotify::init()?;
-    inotify.add_watch(DEV_PATH, WatchMask::CREATE)?;
-    let epoll_event = epoll::Event::new(EPOLLIN, INOTIFY_DATA);
-    epoll::ctl(epoll_fd, EPOLL_CTL_ADD, inotify.as_raw_fd(), epoll_event)?;
-    Ok(inotify)
-}
-
-/// Creates an inotify instance looking at /dev/input and adds it to an epoll instance.
-fn setup_inotify_2() -> io::Result<Inotify> {
-    // Set up inotify to listen for new devices being plugged in
-    let mut inotify = Inotify::init()?;
-    inotify.add_watch(DEV_PATH, WatchMask::CREATE | WatchMask::DELETE)?;
-    Ok(inotify)
-}
-
 #[deprecated(
     since = "0.1.0",
     note = "Use EventListener.iter().filter_map with your own closure that
@@ -586,6 +502,7 @@ pub fn filter_map_events_with_delay_noreturn<F>(mut func: F) -> io::Result<()>
 where
     F: FnMut(InputEvent) -> (Instant, Option<InputEvent>),
 {
+    #[allow(deprecated)]
     filter_map_events_with_delay(|input_event| {
         let (instant, output_event) = func(input_event);
         (instant, output_event, GrabStatus::Continue)
@@ -597,6 +514,7 @@ where
     note = "Use EventListener.iter().take_while().filter_map with your own
     closure that schedules delayed events. See examples/delay.rs"
 )]
+#[allow(deprecated)]
 /// Similar to Iterator's filter_map, only this blocks waiting for input
 ///
 /// Filter and transform events, additionally specifying an Instant at which
@@ -606,95 +524,57 @@ pub fn filter_map_events_with_delay<F>(mut func: F) -> io::Result<()>
 where
     F: FnMut(InputEvent) -> (Instant, Option<InputEvent>, GrabStatus),
 {
-    let (epoll_fd, mut devices, output_devices) = setup_devices()?;
-    let mut inotify = setup_inotify(epoll_fd, &devices)?;
-
-    //grab devices
-    let _grab = devices
-        .iter_mut()
-        .try_for_each(|device| device.grab(evdev_rs::GrabMode::Grab));
-    // create buffer for epoll to fill
-    let mut epoll_buffer = [epoll::Event::new(epoll::Events::empty(), 0); 4];
-    let mut inotify_buffer = vec![0_u8; 4096];
-    let mut events_buffer =
-        BTreeMap::<Instant, (Option<(Instant, InputEvent, usize)>, GrabStatus)>::new();
-    'event_loop: loop {
-        let process_later = events_buffer.split_off(&Instant::now());
+    let mut listener = EventsListener::new(true)?;
+    let mut event_iter = listener.iter();
+    let mut events_buffer = BTreeMap::<(Instant, u64), (InputEvent, Ptr<UInputDevice>)>::new();
+    // Generation acts as a key for events_buffer, so that if two events occur
+    // at the same Instant, they can co-exist in the BTreeMap
+    let mut generation: u64 = 0;
+    'outer: loop {
+        let process_later = events_buffer.split_off(&(Instant::now(), 0));
         let process_now = events_buffer;
         events_buffer = process_later;
-        for (opt, grab_status) in process_now.values() {
-            for (recieved_inst, event, idx) in opt {
-                println!(
-                    "Actual time waited: {}ms",
-                    recieved_inst.elapsed().as_millis()
-                );
-                let output_device = match output_devices.get(*idx) {
-                    Some(out_dev) => out_dev,
-                    None => continue, // Device was unplugged
-                };
-                output_device.write_event(event)?;
-            }
-            if grab_status == &GrabStatus::Stop {
-                break 'event_loop;
-            }
+
+        for (event, device) in process_now.values() {
+            #[cfg(feature = "arc")]
+            device.lock().unwrap().write_event(event)?;
+            #[cfg(not(feature = "arc"))]
+            device.write_event(event)?;
         }
-        // wait at longest until new events need to be processed
-        let wait_ms: i32 = events_buffer
+
+        while events_buffer
             .keys()
             .next()
-            .and_then(|sim_inst| {
-                sim_inst
-                    .checked_duration_since(Instant::now())
-                    .unwrap_or_default()
-                    .as_millis()
-                    .checked_add(1)?
-                    .try_into()
-                    .ok()
-            })
-            .unwrap_or(-1i32);
-        println!("Waiting for {}ms for new events...", wait_ms);
-        let num_events = epoll::wait(epoll_fd, wait_ms, &mut epoll_buffer)?;
-        //add new events to queue
-        'events: for event in epoll_buffer.get(0..num_events).unwrap() {
-            // new device file created
-            if event.data == INOTIFY_DATA {
-                for event in inotify.read_events(&mut inotify_buffer)? {
-                    assert!(
-                        event.mask.contains(inotify::EventMask::CREATE),
-                        "inotify is listening for events other than file creation"
-                    );
-                    add_device_to_epoll_from_inotify_event(epoll_fd, event, &mut devices, true)?;
+            .map(|(instant, _)| &Instant::now() < instant)
+            .unwrap_or(true)
+        {
+            let event = match events_buffer.keys().next() {
+                None => event_iter.next_timeout(None)?,
+                Some((send_instant, _)) => {
+                    let now = Instant::now();
+                    if &now < send_instant {
+                        event_iter.next_timeout(Some(send_instant.duration_since(now)))?
+                    } else {
+                        event_iter.next_timeout(Some(Duration::from_millis(0)))?
+                    }
                 }
-            } else {
-                // Input device recieved event
-                let device_idx = event.data as usize;
-                let device = devices.get(device_idx).unwrap();
-                while device.has_event_pending() {
-                    //TODO: deal with EV_SYN::SYN_DROPPED
-                    let (_, event) = match device.next_event(evdev_rs::ReadFlag::NORMAL) {
-                        Ok(event) => event,
-                        Err(_) => {
-                            let device_fd = device.file().as_raw_fd();
-                            let empty_event = epoll::Event::new(epoll::Events::empty(), 0);
-                            epoll::ctl(epoll_fd, EPOLL_CTL_DEL, device_fd, empty_event)?;
-                            continue 'events;
-                        }
-                    };
-                    let (instant, opt_event, grab_status) = func(event);
-                    let value = opt_event.map(|event| (Instant::now(), event, device_idx));
-                    events_buffer.insert(instant, (value, grab_status));
+            };
+            if let Some((event, device)) = event {
+                let (instant, event, grab) = func(event);
+                if grab == GrabStatus::Stop {
+                    break 'outer Ok(());
+                }
+                if let Some(event) = event {
+                    let entry = events_buffer.insert((instant, generation), (event, device));
+                    assert!(
+                        entry.is_none(),
+                        "Two events occured at the same instant with same generation"
+                    );
+                    generation = generation.wrapping_add(1);
                 }
             }
         }
     }
-
-    for device in devices.iter_mut() {
-        //ungrab devices, ignore errors
-        device.grab(evdev_rs::GrabMode::Ungrab).ok();
-    }
-
-    epoll::close(epoll_fd)?;
-    Ok(())
 }
 
 // TODO: return the never type, `!` when it is stabalized
@@ -704,6 +584,7 @@ pub fn filter_map_events_noreturn<F>(func: F) -> io::Result<()>
 where
     F: Fn(InputEvent) -> Option<InputEvent>,
 {
+    #[allow(deprecated)]
     filter_map_events(|input_event| {
         let output_event = func(input_event);
         (output_event, GrabStatus::Continue)
@@ -714,6 +595,7 @@ where
     since = "0.1.0",
     note = "Use EventListener.iter().take_while().filter_map instead"
 )]
+#[allow(deprecated)]
 /// Similar to Iterator's filter_map, only this blocks waiting for input
 ///
 /// Filter and transform events. To stop grabbing, return `GrabStatus::Stop`
@@ -721,68 +603,25 @@ pub fn filter_map_events<F>(mut func: F) -> io::Result<()>
 where
     F: FnMut(InputEvent) -> (Option<InputEvent>, GrabStatus),
 {
-    let (epoll_fd, mut devices, output_devices) = setup_devices()?;
-    let mut inotify = setup_inotify(epoll_fd, &devices)?;
-
-    //grab devices
-    let _grab = devices
-        .iter_mut()
-        .try_for_each(|device| device.grab(evdev_rs::GrabMode::Grab));
-    // create buffer for epoll to fill
-    let mut epoll_buffer = [epoll::Event::new(epoll::Events::empty(), 0); 4];
-    let mut inotify_buffer = vec![0_u8; 4096];
-    'event_loop: loop {
-        let num_events = epoll::wait(epoll_fd, -1, &mut epoll_buffer)?;
-
-        //map and simulate events, dealing with
-        'events: for event in &epoll_buffer[0..num_events] {
-            // new device file created
-            if event.data == INOTIFY_DATA {
-                for event in inotify.read_events(&mut inotify_buffer)? {
-                    assert!(
-                        event.mask.contains(inotify::EventMask::CREATE),
-                        "inotify is listening for events other than file creation"
-                    );
-                    add_device_to_epoll_from_inotify_event(epoll_fd, event, &mut devices, true)?;
-                }
-            } else {
-                // Input device recieved event
-                let device_idx = event.data as usize;
-                let device = devices.get(device_idx).unwrap();
-                while device.has_event_pending() {
-                    //TODO: deal with EV_SYN::SYN_DROPPED
-                    let (_, event) = match device.next_event(evdev_rs::ReadFlag::NORMAL) {
-                        Ok(event) => event,
-                        Err(_) => {
-                            let device_fd = device.file().as_raw_fd();
-                            let empty_event = epoll::Event::new(epoll::Events::empty(), 0);
-                            epoll::ctl(epoll_fd, EPOLL_CTL_DEL, device_fd, empty_event)?;
-                            continue 'events;
-                        }
-                    };
-                    let (event, grab_status) = func(event);
-                    if let (Some(event), Some(out_device)) = (event, output_devices.get(device_idx))
-                    {
-                        out_device.write_event(&event)?
-                    }
-                    if grab_status == GrabStatus::Stop {
-                        break 'event_loop;
-                    }
-                }
-            }
-        }
-    }
-
-    for device in devices.iter_mut() {
-        //ungrab devices, ignore errors
-        device.grab(evdev_rs::GrabMode::Ungrab).ok();
-    }
-
-    epoll::close(epoll_fd)?;
-    Ok(())
+    let mut listener = EventsListener::new(true)?;
+    listener
+        .iter()
+        .map(|(event, device)| {
+            let (new_event, status) = func(event);
+            (new_event, device, status)
+        })
+        .take_while(|(_, _, status)| status != &GrabStatus::Stop)
+        .filter_map(|(event, device, _)| event.map(|event| (event, device)))
+        .try_for_each(|(event, device)| {
+            #[cfg(feature = "arc")]
+            return device.lock().unwrap().write_event(&event);
+            #[cfg(not(feature = "arc"))]
+            device.write_event(&event)
+        })
 }
 
 #[deprecated(since = "0.1.0", note = "Use EventListener.iter().for_each instead")]
+#[allow(deprecated)]
 /// Similar to Iterator's for_each, only this blocks waiting for input
 ///
 /// Calls a closure on each event. To stop grabbing, return `GrabStatus::Stop`
@@ -790,49 +629,11 @@ pub fn for_each_event<F>(mut func: F) -> io::Result<()>
 where
     F: FnMut(InputEvent) -> GrabStatus,
 {
-    let (epoll_fd, mut devices, _output_devices) = setup_devices()?;
-    let mut inotify = setup_inotify(epoll_fd, &devices)?;
-
-    // create buffer for epoll to fill
-    let mut epoll_buffer = [epoll::Event::new(epoll::Events::empty(), 0); 4];
-    let mut inotify_buffer = vec![0_u8; 4096];
-    'event_loop: loop {
-        let num_events = epoll::wait(epoll_fd, -1, &mut epoll_buffer)?;
-
-        //map and simulate events, dealing with
-        'events: for event in &epoll_buffer[0..num_events] {
-            // new device file created
-            if event.data == INOTIFY_DATA {
-                for event in inotify.read_events(&mut inotify_buffer)? {
-                    assert!(
-                        event.mask.contains(inotify::EventMask::CREATE),
-                        "inotify is listening for events other than file creation"
-                    );
-                    add_device_to_epoll_from_inotify_event(epoll_fd, event, &mut devices, false)?;
-                }
-            } else {
-                // Input device recieved event
-                let device_idx = event.data as usize;
-                let device = devices.get(device_idx).unwrap();
-                while device.has_event_pending() {
-                    let (_, event) = match device.next_event(evdev_rs::ReadFlag::NORMAL) {
-                        Ok(event) => event,
-                        Err(_) => {
-                            let device_fd = device.file().as_raw_fd();
-                            let empty_event = epoll::Event::new(epoll::Events::empty(), 0);
-                            epoll::ctl(epoll_fd, EPOLL_CTL_DEL, device_fd, empty_event)?;
-                            continue 'events;
-                        }
-                    };
-                    let grab_status = func(event);
-                    if grab_status == GrabStatus::Stop {
-                        break 'event_loop;
-                    }
-                }
-            }
+    let mut listener = EventsListener::new(false)?;
+    for (event, _) in listener.iter() {
+        if func(event) == GrabStatus::Stop {
+            break;
         }
     }
-
-    epoll::close(epoll_fd)?;
     Ok(())
 }
