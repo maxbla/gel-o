@@ -30,14 +30,14 @@ Gel-O is experimental. Expect many breaking changes to come.
         - `#yum install autoconf libtool`
         - `#pacman -S autoconf libtool`
 
-macOs and Windows are not supported and support is not planned. BSD support may be easy to add, as evdev was recently added to FreeBSD.
+macOS and Windows are not supported and support is not planned. BSD support may be easy to add, as evdev was recently added to FreeBSD.
 
 ## FAQ
 
 - How does it work?
     - Gel-O monitors device files in `/dev/input`, reading `InputEvents` lazily only when user code calls `.next()`.
 - Does it work when using the [Wayland Display Server Protocol](https://wayland.freedesktop.org/)?
-    - Yes. Wayland works everywhere linux does - on Xorg, Wayland, and even the Linux virtual terminal
+    - Yes. Gel-O works everywhere linux does - on Xorg, Wayland, and even the Linux virtual terminal
 - What is the computational overhead of Gel-O?
     - Gel-O is pretty leightweight. Most of the examples use around 1MB of RAM. Mouse movement is smooth on low-power devices (such as Raspberry Pi) due to efficient epoll-based architecture. On raspberry pi 3, expect Gel-O to use ~2% CPU during rapid mouse movement and 0% otherwise.
 - What devices does Gel-O work with?
