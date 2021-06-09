@@ -2,10 +2,6 @@ use evdev_rs::{Device, InputEvent, UInputDevice, LibevdevWrapper};
 use gelo::{EventsListener, Ptr};
 use std::collections::BTreeMap;
 use std::env;
-#[cfg(not(feature = "arc"))]
-use std::rc::Rc;
-#[cfg(feature = "arc")]
-use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -25,24 +21,28 @@ fn main() -> std::io::Result<()> {
     };
     let delay_dur = Duration::from_millis(ms_delay.into());
 
-    //TODO: remove this hack
-    //wait for enter key to be released after starting
+    // TODO: remove this hack
+    // wait for enter key to be released after starting
     sleep(Duration::from_millis(100));
 
+    // Listen on mice (EV_REL), but not keyboards
     let mut listener = EventsListener::new_with_filter(
         true,
         |device: &Device| device.has_event_type(&evdev_rs::enums::EventType::EV_REL)
     )?;
     let mut event_iter = listener.iter();
+    // A Map of (time to simulate event, generation) -> (Event to simulate, device on which to simulate it)
     let mut events_buffer = BTreeMap::<(Instant, u64), (InputEvent, Ptr<UInputDevice>)>::new();
     // Generation acts as a key for events_buffer, so that if two events occur
     // at the same Instant, they can co-exist in the BTreeMap
     let mut generation: u64 = 0;
+
     loop {
         let process_later = events_buffer.split_off(&(Instant::now(), 0));
         let process_now = events_buffer;
         events_buffer = process_later;
 
+        // send events to devices if their key (time to simulate event) is in the past
         for (event, device) in process_now.values() {
             #[cfg(feature = "arc")]
             device.lock().unwrap().write_event(event)?;
@@ -50,12 +50,15 @@ fn main() -> std::io::Result<()> {
             device.write_event(event)?;
         }
 
+        // while the next event to simulate is in the future or there is no next event
         while events_buffer
             .keys()
             .next()
             .map(|(instant, _)| &Instant::now() < instant)
             .unwrap_or(true)
         {
+            // Wait for a new event just long enough that you won't delay the
+            // next event that needs to be sent to a device
             let event = match events_buffer.keys().next() {
                 None => event_iter.next_timeout(None)?,
                 Some((send_instant, _)) => {
@@ -67,6 +70,7 @@ fn main() -> std::io::Result<()> {
                     }
                 }
             };
+            // Add newly recieved events to the event buffer
             if let Some(event) = event {
                 let entry = events_buffer.insert((Instant::now() + delay_dur, generation), event);
                 assert!(
@@ -77,6 +81,4 @@ fn main() -> std::io::Result<()> {
             }
         }
     }
-
-    Ok(())
 }
