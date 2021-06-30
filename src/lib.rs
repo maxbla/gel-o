@@ -6,17 +6,18 @@ pub use crate::deprecated::*;
 use epoll::ControlOptions::{EPOLL_CTL_ADD, EPOLL_CTL_DEL};
 use evdev_rs::{Device, InputEvent, ReadFlag, ReadStatus, UInputDevice};
 use inotify::{EventMask, Inotify, WatchMask};
-use std::os::unix::{
+use libc::c_void;
+use std::{ffi::CString, os::unix::{
     ffi::OsStrExt,
     fs::FileTypeExt,
     io::{AsRawFd, FromRawFd, RawFd},
-};
+}};
 #[cfg(feature = "arc")]
 use std::sync::Mutex;
 use std::{
     collections::HashMap,
     convert::TryInto,
-    ffi::{CString, OsStr, OsString},
+    ffi::{OsStr, OsString},
     fs::{read_dir, File},
     io,
     path::{Path, PathBuf},
@@ -132,6 +133,7 @@ impl EventsListener {
     ///
     /// Panics if you give it an index that does not correspond to a device
     /// Usual EV_SYN caveat applies - events not processed until EV_SYN/SYN_REPORT is sent
+    /// The device with index idx must have the input event's `EventType` enabled otherwise the event will be ignored
     /// Prefer iter()
     pub fn simulate(&self, event: InputEvent, device_idx: u64) -> io::Result<()> {
         let output_device = self
@@ -160,7 +162,7 @@ pub struct InputIter<'a> {
 }
 
 impl<'a> InputIter<'a> {
-    /// Returns true if a new event is queued up (calling next() would not block)
+    /// Returns true if calling next() would not block
     pub fn ready(&mut self) -> io::Result<bool> {
         match self.listener.epoll_buffer {
             Some(_) => Ok(true),
@@ -230,124 +232,119 @@ impl<'a> InputIter<'a> {
         };
 
         let end_instant = timeout.map(|timeout| Instant::now() + timeout);
-        while end_instant
-            .map(|end_instant| Instant::now() < end_instant)
-            .unwrap_or(true)
+        // eagerly update map of devcie files
+        // previously, this was done through epoll,
+        // but that caused bugs, as if a device was un plugged, then plugged back it
+        // it might have been ignored by device de-dupe logic
+        for event in self
+            .listener
+            .inotify
+            .read_events(&mut self.listener.inotify_buffer)?
         {
-            // eagerly update map of devcie files
-            // previously, this was done through epoll,
-            // but that caused bugs, as if a device was un plugged, then plugged back it
-            // it might have been ignored by device de-dupe logic
-            for event in self
-                .listener
-                .inotify
-                .read_events(&mut self.listener.inotify_buffer)?
-            {
-                if event.mask.contains(EventMask::CREATE | EventMask::DELETE) {
-                    panic!("Both created and deleted. Logic does not properly handle this case");
-                } else if event.mask.contains(EventMask::CREATE) {
-                    let is_uidevice = self
-                        .listener
-                        .devices
-                        .values()
-                        .any(|(_, (ui_path, _))| ui_path.file_name() == event.name);
-                    if !is_uidevice {
-                        let maybe_device = get_device_from_inotify_event(event);
-                        let (path, mut device) = match maybe_device {
-                            None => continue, //file cannot be used to initalize a Device. Skip.
-                            Some(device) => device?,
-                        };
-                        let filter: DeviceFilter = self.listener.filter;
-                        if !filter(&device) {
-                            continue;
-                        }
-                        if self.listener.grab {
-                            device.grab(evdev_rs::GrabMode::Grab)?;
-                        }
-                        let out_device = UInputDevice::create_from_device(&device)?;
-                        let ui_path = PathBuf::from(out_device.devnode().unwrap_or(""));
-                        let fd = device.file().as_raw_fd();
-                        let idx = &mut self.listener.idx;
-                        let event = epoll::Event::new(EPOLLIN, *idx);
-                        #[cfg(not(feature = "arc"))]
-                        self.listener
-                            .devices
-                            .insert(*idx, ((path, device), (ui_path, Ptr::new(out_device))));
-                        #[cfg(feature = "arc")]
-                        self.listener.devices.insert(
-                            *idx,
-                            ((path, device), (ui_path, Ptr::new(Mutex::new(out_device)))),
-                        );
-                        *idx += 1;
-                        epoll::ctl(self.listener.epoll_fd, EPOLL_CTL_ADD, fd, event)?;
+            if event.mask.contains(EventMask::CREATE | EventMask::DELETE) {
+                panic!("Both created and deleted. Logic does not properly handle this case");
+            } else if event.mask.contains(EventMask::CREATE) {
+                let is_uidevice = self
+                    .listener
+                    .devices
+                    .values()
+                    .any(|(_, (ui_path, _))| ui_path.file_name() == event.name);
+                if !is_uidevice {
+                    let maybe_device = get_device_from_inotify_event(event);
+                    let (path, mut device) = match maybe_device {
+                        None => continue, //file cannot be used to initalize a Device. Skip.
+                        Some(device) => device?,
+                    };
+                    let filter: DeviceFilter = self.listener.filter;
+                    if !filter(&device) {
+                        continue;
                     }
-                } else if event.mask.contains(EventMask::DELETE) {
-                    if let Some(((_, device), _)) = self
-                        .listener
-                        .devices
-                        .values()
-                        .find(|((path, _), ..)| path.file_name() == event.name)
-                    {
-                        epoll::ctl(
-                            self.listener.epoll_fd,
-                            EPOLL_CTL_DEL,
-                            device.file().as_raw_fd(),
-                            epoll::Event::new(epoll::Events::empty(), 0),
-                        )?;
-                    } else {
-                        // simply ignore. It would be nice to run a sanity check here,
-                        // bit that's not possible
-                        // panic!("Device that doesn't exist was unplugged")
+                    if self.listener.grab {
+                        device.grab(evdev_rs::GrabMode::Grab)?;
                     }
-                    // remove all devices with same path as deleted file
+                    let out_device = UInputDevice::create_from_device(&device)?;
+                    let ui_path = PathBuf::from(out_device.devnode().unwrap_or(""));
+                    let fd = device.file().as_raw_fd();
+                    let idx = &mut self.listener.idx;
+                    let event = epoll::Event::new(EPOLLIN, *idx);
+                    #[cfg(not(feature = "arc"))]
                     self.listener
                         .devices
-                        .retain(|_idx, ((path, _), ..)| path.file_name() != event.name);
+                        .insert(*idx, ((path, device), (ui_path, Ptr::new(out_device))));
+                    #[cfg(feature = "arc")]
+                    self.listener.devices.insert(
+                        *idx,
+                        ((path, device), (ui_path, Ptr::new(Mutex::new(out_device)))),
+                    );
+                    *idx += 1;
+                    epoll::ctl(self.listener.epoll_fd, EPOLL_CTL_ADD, fd, event)?;
+                }
+            } else if event.mask.contains(EventMask::DELETE) {
+                if let Some(((_, device), _)) = self
+                    .listener
+                    .devices
+                    .values()
+                    .find(|((path, _), ..)| path.file_name() == event.name)
+                {
+                    epoll::ctl(
+                        self.listener.epoll_fd,
+                        EPOLL_CTL_DEL,
+                        device.file().as_raw_fd(),
+                        epoll::Event::new(epoll::Events::empty(), 0),
+                    )?;
                 } else {
-                    panic!("inotify is listening for events other than file creation");
+                    // simply ignore. It would be nice to run a sanity check here,
+                    // bit that's not possible
+                    // panic!("Device that doesn't exist was unplugged")
+                }
+                // remove all devices with same path as deleted file
+                self.listener
+                    .devices
+                    .retain(|_idx, ((path, _), ..)| path.file_name() != event.name);
+            } else {
+                panic!("inotify is listening for events other than file creation");
+            }
+        }
+
+        // wait for next event or get event from buffer
+        let event = match self.listener.epoll_buffer {
+            Some(epoll_buffer) => {
+                let event = epoll_buffer[0];
+                self.listener.epoll_buffer = None;
+                event
+            }
+            None => {
+                let mut epoll_buffer = [epoll::Event::new(epoll::Events::empty(), 0); 1];
+                let timeout_millis = if let Some(end_instant) = end_instant {
+                    let now = Instant::now();
+                    if now < end_instant {
+                        end_instant
+                            .duration_since(now)
+                            .as_millis()
+                            .try_into()
+                            .map_err(|_| {
+                                io::Error::new(io::ErrorKind::InvalidInput, "timeout too long")
+                            })?
+                    } else {
+                        0
+                    }
+                } else {
+                    -1
+                };
+                let num_events =
+                    epoll::wait(self.listener.epoll_fd, timeout_millis, &mut epoll_buffer)?;
+                match num_events {
+                    0 => return Ok(None),
+                    1 => epoll_buffer[0],
+                    _ => panic!("epoll_wait didn't work as expected"),
                 }
             }
+        };
 
-            let event = match self.listener.epoll_buffer {
-                Some(epoll_buffer) => {
-                    let event = epoll_buffer[0];
-                    self.listener.epoll_buffer = None;
-                    event
-                }
-                None => {
-                    let mut epoll_buffer = [epoll::Event::new(epoll::Events::empty(), 0); 1];
-                    let timeout_millis = if let Some(end_instant) = end_instant {
-                        let now = Instant::now();
-                        if now < end_instant {
-                            end_instant
-                                .duration_since(now)
-                                .as_millis()
-                                .try_into()
-                                .map_err(|_| {
-                                    io::Error::new(io::ErrorKind::InvalidInput, "timeout too long")
-                                })?
-                        } else {
-                            0
-                        }
-                    } else {
-                        -1
-                    };
-                    let num_events =
-                        epoll::wait(self.listener.epoll_fd, timeout_millis, &mut epoll_buffer)?;
-                    match num_events {
-                        0 => return Ok(None),
-                        1 => epoll_buffer[0],
-                        _ => panic!("epoll_wait didn't work as expected"),
-                    }
-                }
-            };
-
-            let device_idx = event.data;
-            return self
-                .device_next(device_idx)
-                .map(|event| event.map(|inner| (inner.1, inner.2)));
-        }
-        Ok(None)
+        let device_idx = event.data;
+        return self
+            .device_next(device_idx)
+            .map(|event| event.map(|inner| (inner.1, inner.2)));
     }
 }
 
@@ -437,19 +434,27 @@ fn get_device_from_inotify_event(
 }
 
 /// Open an fd with O_RDONLY | O_NONBLOCK
-fn open_file_nonblock<P: AsRef<OsStr>>(path: P) -> io::Result<File> {
-    let path = CString::new(path.as_ref().as_bytes())
+fn open_file_nonblock<P: AsRef<Path>>(path: P) -> io::Result<File> {
+    let path = CString::new(path.as_ref().as_os_str().as_bytes())
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-    let fd = match unsafe { libc::open(path.into_raw(), libc::O_RDONLY | libc::O_NONBLOCK) } {
-        -1 => return Err(io::Error::last_os_error()),
-        res => res,
-    };
-    let mut buf = [0u8; 128];
-    let mut res = 0;
-    while res >= 0 {
-        res = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, 128) };
+    let open_flags = libc::O_RDONLY | libc::O_NONBLOCK;
+    let fd = unsafe { libc::open(path.into_raw(), open_flags) };
+    if fd == -1 {
+        return Err(io::Error::last_os_error())
     }
-    assert!(io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock);
+    // read to end of file
+    // libevdev docs say you need to read all events off the file before calling set_fd
+    let mut buf = [0u8; 128];
+    let mut res = 1;
+    while res > 0 {
+        res = unsafe {
+            libc::read(fd, buf.as_mut_ptr() as *mut c_void, buf.len())
+        };
+    }
+    let last_error = io::Error::last_os_error();
+    if res == -1 && last_error.kind() != io::ErrorKind::WouldBlock {
+        return Err(last_error)
+    }
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
@@ -457,7 +462,7 @@ fn open_file_nonblock<P: AsRef<OsStr>>(path: P) -> io::Result<File> {
 /// UInputDevice that any events read from the device can be simulated on.
 /// The epoll_fd is level-triggered on the device file.
 fn setup_devices(
-    include: DeviceFilter,
+    filter: DeviceFilter,
 ) -> io::Result<(
     RawFd,
     HashMap<u64, (PathFile<Device>, PathFile<UInputDevice>)>,
@@ -468,7 +473,7 @@ fn setup_devices(
     for (idx, path) in device_paths.into_iter().enumerate() {
         let file = open_file_nonblock(path.clone())?;
         let device = Device::new_from_file(file)?;
-        if !include(&device) {
+        if !filter(&device) {
             continue;
         }
         let idx = idx.try_into().unwrap();

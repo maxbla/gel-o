@@ -17,7 +17,7 @@ name = "gelo"
 path = "src/lib.rs"
 
 [dependencies]
-evdev-rs = {git="https://github.com/ndesh26/evdev-rs.git"}
+evdev-rs = "0.5.0"
 libc = "0.2.82"
 epoll = "4.1.0"
 inotify = {version = "0.8.2", default-features=false}

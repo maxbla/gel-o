@@ -1,4 +1,7 @@
-use evdev_rs::{Device, InputEvent, UInputDevice, LibevdevWrapper};
+use evdev_rs::{
+    enums::{EventCode, EV_KEY},
+    Device, DeviceWrapper, InputEvent, UInputDevice,
+};
 use gelo::{EventsListener, Ptr};
 use std::collections::BTreeMap;
 use std::env;
@@ -25,11 +28,11 @@ fn main() -> std::io::Result<()> {
     // wait for enter key to be released after starting
     sleep(Duration::from_millis(100));
 
-    // Listen on mice (EV_REL), but not keyboards
-    let mut listener = EventsListener::new_with_filter(
-        true,
-        |device: &Device| device.has_event_type(&evdev_rs::enums::EventType::EV_REL)
-    )?;
+    // Listen on mice, but not keyboards
+    let mut listener = EventsListener::new_with_filter(true, |device: &Device| {
+        device.has_event_type(&evdev_rs::enums::EventType::EV_REL)
+            && device.has_event_code(&EventCode::EV_KEY(EV_KEY::BTN_LEFT))
+    })?;
     let mut event_iter = listener.iter();
     // A Map of (time to simulate event, generation) -> (Event to simulate, device on which to simulate it)
     let mut events_buffer = BTreeMap::<(Instant, u64), (InputEvent, Ptr<UInputDevice>)>::new();

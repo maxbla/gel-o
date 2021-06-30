@@ -43,7 +43,7 @@ macOS and Windows are not supported and support is not planned. BSD support may 
 - What devices does Gel-O work with?
     - Gel-O works with every input device Linux does because Gel-O operates just above the driver level. Gel-O has been tested specifically with mice, keyboards, power buttons and gamepads.
 - What happens if I unplug my device and plug it back in?
-    Gel-O detects new devices being plugged in, and starts monitoring them. Unplugging and plugging in might mean a few events are lost, but everything will continue smoothly after that loss.
+    - Gel-O detects new devices being plugged in, and starts monitoring them. Unplugging and plugging in might mean a few events are lost, but everything will continue smoothly after that loss.
 
 ## Limitations
 
