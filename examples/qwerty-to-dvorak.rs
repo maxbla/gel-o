@@ -1,13 +1,13 @@
 //! Make your QWERTY keyboard act like a DVORAK...
 //! the wrong way
 use evdev_rs::{
+    enums::{EventCode, EV_KEY},
     InputEvent,
-    enums::{EventCode, EV_KEY}
 };
-use EV_KEY::*;
 use gelo::EventsListener;
 use std::thread::sleep;
 use std::time::Duration;
+use EV_KEY::*;
 
 fn qwerty_to_dvorak(event: InputEvent) -> InputEvent {
     match event.event_code {

@@ -1,23 +1,25 @@
-use evdev_rs::{enums::InputProp, Device, DeviceWrapper, InputEvent, UInputDevice};
-use gelo::EventsListener;
-use std::{
-    collections::BTreeMap,
-    env,
-    sync::mpsc::{channel, Receiver},
-    sync::{Arc, Mutex},
-    thread::sleep,
-    time::{Duration, Instant},
-};
-
-const DEFAULT_MS_DELAY: u32 = 60;
-
-fn main() -> std::io::Result<()> {
-    #[cfg(not(feature = "arc"))]
-    compile_error!(
+#[cfg(not(feature = "arc"))]
+fn main() {
+    eprintln!(
         "This example requires feature arc.
         Try rerunning with --features=arc"
     );
+}
 
+#[cfg(feature = "arc")]
+fn main() -> std::io::Result<()> {
+    use evdev_rs::{enums::InputProp, Device, DeviceWrapper, InputEvent, UInputDevice};
+    use gelo::EventsListener;
+    use std::{
+        collections::BTreeMap,
+        env,
+        sync::mpsc::{channel, Receiver},
+        sync::{Arc, Mutex},
+        thread::sleep,
+        time::{Duration, Instant},
+    };
+
+    const DEFAULT_MS_DELAY: u32 = 60;
     let ms_delay = env::args().nth(1).map(|arg| arg.parse().ok()).flatten();
     let ms_delay = match ms_delay {
         None => {

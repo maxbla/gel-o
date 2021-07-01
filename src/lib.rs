@@ -1,17 +1,12 @@
 mod deprecated;
 
-pub use evdev_rs;
 pub use crate::deprecated::*;
+pub use evdev_rs;
 
 use epoll::ControlOptions::{EPOLL_CTL_ADD, EPOLL_CTL_DEL};
 use evdev_rs::{Device, InputEvent, ReadFlag, ReadStatus, UInputDevice};
 use inotify::{EventMask, Inotify, WatchMask};
 use libc::c_void;
-use std::{ffi::CString, os::unix::{
-    ffi::OsStrExt,
-    fs::FileTypeExt,
-    io::{AsRawFd, FromRawFd, RawFd},
-}};
 #[cfg(feature = "arc")]
 use std::sync::Mutex;
 use std::{
@@ -22,6 +17,14 @@ use std::{
     io,
     path::{Path, PathBuf},
     time::{Duration, Instant},
+};
+use std::{
+    ffi::CString,
+    os::unix::{
+        ffi::OsStrExt,
+        fs::FileTypeExt,
+        io::{AsRawFd, FromRawFd, RawFd},
+    },
 };
 
 static DEV_PATH: &str = "/dev/input";
@@ -440,20 +443,18 @@ fn open_file_nonblock<P: AsRef<Path>>(path: P) -> io::Result<File> {
     let open_flags = libc::O_RDONLY | libc::O_NONBLOCK;
     let fd = unsafe { libc::open(path.into_raw(), open_flags) };
     if fd == -1 {
-        return Err(io::Error::last_os_error())
+        return Err(io::Error::last_os_error());
     }
     // read to end of file
     // libevdev docs say you need to read all events off the file before calling set_fd
     let mut buf = [0u8; 128];
     let mut res = 1;
     while res > 0 {
-        res = unsafe {
-            libc::read(fd, buf.as_mut_ptr() as *mut c_void, buf.len())
-        };
+        res = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
     }
     let last_error = io::Error::last_os_error();
     if res == -1 && last_error.kind() != io::ErrorKind::WouldBlock {
-        return Err(last_error)
+        return Err(last_error);
     }
     Ok(unsafe { File::from_raw_fd(fd) })
 }
@@ -461,6 +462,7 @@ fn open_file_nonblock<P: AsRef<Path>>(path: P) -> io::Result<File> {
 /// Returns tuple of epoll_fd and a hashmap containing a device and a
 /// UInputDevice that any events read from the device can be simulated on.
 /// The epoll_fd is level-triggered on the device file.
+#[allow(clippy::type_complexity)]
 fn setup_devices(
     filter: DeviceFilter,
 ) -> io::Result<(
