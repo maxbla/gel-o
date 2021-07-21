@@ -29,7 +29,7 @@ fn main() -> std::io::Result<()> {
     sleep(Duration::from_millis(100));
 
     // Listen on mice, but not keyboards
-    let mut listener = EventsListener::new_with_filter(true, |device: &Device| {
+    let mut listener = EventsListener::new_filtered(true, |device: &Device| {
         device.has_event_type(&evdev_rs::enums::EventType::EV_REL)
             && device.has_event_code(&EventCode::EV_KEY(EV_KEY::BTN_LEFT))
     })?;

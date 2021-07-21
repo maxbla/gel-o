@@ -4,7 +4,7 @@ pub use crate::deprecated::*;
 pub use evdev_rs;
 
 use epoll::ControlOptions::{EPOLL_CTL_ADD, EPOLL_CTL_DEL};
-use evdev_rs::{Device, InputEvent, ReadFlag, ReadStatus, UInputDevice};
+use evdev_rs::{Device, DeviceWrapper, InputEvent, ReadFlag, ReadStatus, UInputDevice};
 use inotify::{EventMask, Inotify, WatchMask};
 use libc::c_void;
 #[cfg(feature = "arc")]
@@ -12,19 +12,18 @@ use std::sync::Mutex;
 use std::{
     collections::HashMap,
     convert::TryInto,
-    ffi::{OsStr, OsString},
+    ffi::{CString, OsStr, OsString},
+    fmt,
+    fmt::{Debug, Formatter},
     fs::{read_dir, File},
     io,
-    path::{Path, PathBuf},
-    time::{Duration, Instant},
-};
-use std::{
-    ffi::CString,
     os::unix::{
         ffi::OsStrExt,
         fs::FileTypeExt,
         io::{AsRawFd, FromRawFd, RawFd},
     },
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 static DEV_PATH: &str = "/dev/input";
@@ -40,13 +39,11 @@ pub type Ptr<T> = std::rc::Rc<T>;
 /// for example evdev::Device
 pub type PathFile<T> = (PathBuf, T);
 
-pub type DeviceFilter = fn(&Device) -> bool;
-
 /// A handle to all resources needed to listen for and simulate input events
 ///
 /// Creating multiple `EventsListener`s is fraught, as the order of event
 /// delivery to `EventsListener`s is unspecified
-pub struct EventsListener {
+pub struct EventsListener<P: Fn(&Device) -> bool> {
     epoll_fd: RawFd,
     epoll_buffer: Option<[epoll::Event; 1]>,
     /// monotonically increasing index for inserting into hashmap
@@ -56,10 +53,27 @@ pub struct EventsListener {
     grab: bool,
     inotify: Inotify,
     inotify_buffer: Vec<u8>,
-    filter: DeviceFilter,
+    predicate: P,
 }
 
-impl Drop for EventsListener {
+impl<P: Fn(&Device) -> bool> Debug for EventsListener<P> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        writeln!(f, "[")?;
+        for ((dev_path, dev), (uinput_path, _uinput)) in self.devices.values() {
+            writeln!(
+                f,
+                "devnode:{}, uinput devnode:{}, device name:{}",
+                dev_path.display(),
+                uinput_path.display(),
+                dev.name().unwrap_or(""),
+            )?;
+        }
+        write!(f, "]")?;
+        Ok(())
+    }
+}
+
+impl<P: Fn(&Device) -> bool> Drop for EventsListener<P> {
     fn drop(&mut self) {
         if self.grab {
             for ((_path, device), (_, _)) in self.devices.values_mut() {
@@ -71,27 +85,31 @@ impl Drop for EventsListener {
     }
 }
 
-impl EventsListener {
+impl EventsListener<fn(&Device) -> bool> {
     /// Gets a new events listener.
     ///
     /// Grab determines whether the events are automatically delivered further
     /// up the stack. If grabbing, you must simulate any event you recieve
-    /// gor the OS to see it.
-    pub fn new(grab: bool) -> io::Result<EventsListener> {
-        let filter = |_: &Device| true;
-        Self::new_with_filter(grab, filter)
+    /// for the OS to see it.
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new(grab: bool) -> io::Result<EventsListener<impl Fn(&Device) -> bool>> {
+        Self::new_filtered(grab, |_| true)
     }
+}
 
+impl<P: Fn(&Device) -> bool> EventsListener<P> {
     /// Like `new`, only allows a filter, so some devices are not grabbed.
     ///
-    /// filter must return the same value when called multiple times on the
-    /// same device
+    /// Works just like Rust's Iterator - if the closure returns true, the
+    /// device is included in the EventsListener, otherwise it isn't included.
+    /// Filter must return the same value when called multiple times on the
+    /// same device (this may be enforced at a later date)
     ///
-    /// This method is immensely usefuly for testing, as it allows capturing
-    /// only mouse input (in the event of a bug, you can press ctrl+c or even
-    /// switch to the linux virtual terminal with ctrl+alt+F6 then use kill/htop)
-    pub fn new_with_filter(grab: bool, filter: DeviceFilter) -> io::Result<EventsListener> {
-        let (epoll_fd, devices) = setup_devices(filter)?;
+    /// This method is usefuly for testing, as it allows capturing e.g. only
+    /// mouse input so in the event of a bug, you can press ctrl+c or even
+    /// switch to the linux virtual terminal with ctrl+alt+F3 then use kill/htop
+    pub fn new_filtered(grab: bool, filter: P) -> io::Result<EventsListener<P>> {
+        let (epoll_fd, devices) = setup_devices(&filter)?;
         let mut devices: HashMap<u64, _> = devices
             .into_iter()
             .map(|(idx, ((path, dev), (ui_path, ui_dev)))| {
@@ -120,16 +138,20 @@ impl EventsListener {
             grab,
             inotify,
             inotify_buffer,
-            filter,
+            predicate: filter,
         })
     }
 
-    pub fn iter(&mut self) -> InputIter {
+    pub fn iter(&mut self) -> InputIter<P> {
         InputIter {
             listener: self,
             last_device_idx: None,
             syncing: false,
         }
+    }
+
+    pub fn devices(&self) -> &HashMap<u64, (PathFile<Device>, PathFile<Ptr<UInputDevice>>)> {
+        &self.devices
     }
 
     /// Simulate an event on a device
@@ -158,13 +180,13 @@ impl EventsListener {
 }
 
 /// An iterator over evdev InputEvents
-pub struct InputIter<'a> {
-    listener: &'a mut EventsListener,
+pub struct InputIter<'a, P: Fn(&Device) -> bool> {
+    listener: &'a mut EventsListener<P>,
     last_device_idx: Option<u64>,
     syncing: bool,
 }
 
-impl<'a> InputIter<'a> {
+impl<'a, P: Fn(&Device) -> bool> InputIter<'a, P> {
     /// Returns true if calling next() would not block
     pub fn ready(&mut self) -> io::Result<bool> {
         match self.listener.epoll_buffer {
@@ -258,8 +280,8 @@ impl<'a> InputIter<'a> {
                         None => continue, //file cannot be used to initalize a Device. Skip.
                         Some(device) => device?,
                     };
-                    let filter: DeviceFilter = self.listener.filter;
-                    if !filter(&device) {
+                    //let filter: DeviceFilter = self.listener.filter;
+                    if !(self.listener.predicate)(&device) {
                         continue;
                     }
                     if self.listener.grab {
@@ -351,7 +373,7 @@ impl<'a> InputIter<'a> {
     }
 }
 
-impl<'a> std::iter::Iterator for InputIter<'a> {
+impl<'a, P: Fn(&Device) -> bool> std::iter::Iterator for InputIter<'a, P> {
     type Item = (InputEvent, Ptr<UInputDevice>);
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -463,8 +485,8 @@ fn open_file_nonblock<P: AsRef<Path>>(path: P) -> io::Result<File> {
 /// UInputDevice that any events read from the device can be simulated on.
 /// The epoll_fd is level-triggered on the device file.
 #[allow(clippy::type_complexity)]
-fn setup_devices(
-    filter: DeviceFilter,
+fn setup_devices<P: Fn(&Device) -> bool>(
+    predicate: P,
 ) -> io::Result<(
     RawFd,
     HashMap<u64, (PathFile<Device>, PathFile<UInputDevice>)>,
@@ -475,7 +497,7 @@ fn setup_devices(
     for (idx, path) in device_paths.into_iter().enumerate() {
         let file = open_file_nonblock(path.clone())?;
         let device = Device::new_from_file(file)?;
-        if !filter(&device) {
+        if !predicate(&device) {
             continue;
         }
         let idx = idx.try_into().unwrap();
