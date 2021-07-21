@@ -1,4 +1,6 @@
 mod deprecated;
+#[cfg(test)]
+mod test;
 
 pub use crate::deprecated::*;
 pub use evdev_rs;

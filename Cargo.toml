@@ -23,7 +23,8 @@ epoll = "4.1.0"
 inotify = {version = "0.8.2", default-features=false}
 
 [dev-dependencies]
-serde_json="1.0.61"
+serde_json = "1.0.61"
+serial_test = "0.5.1"
 
 [badges]
 maintenance = { status = "experimental" }
