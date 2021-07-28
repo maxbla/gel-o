@@ -64,6 +64,7 @@ Run the produced binary with root privledges
 ```
 sudo ./target/release/examples/delay [number of ms to delay]
 ```
-make changes to source files. Before committing, run `checks.sh` (this checks formatting and for compiler warnings)
-## TODO
-- [ ] add tests
+make changes to source files. Before committing, run `checks.sh` (this checks formatting and for compiler warnings) and test you changes locally
+```
+./checks.sh && cargo test --no-run && sudo --preserve-env cargo test
+```
